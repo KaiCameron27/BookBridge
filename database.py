@@ -35,6 +35,9 @@ def init_db():
     conn = get_connection(include_db=True)
     cursor = conn.cursor()
 
+    # Drop messages table if exists to clean up chat features
+    cursor.execute("DROP TABLE IF EXISTS messages;")
+
     # Таблица пользователей
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
@@ -124,20 +127,7 @@ def init_db():
     ) ENGINE=InnoDB;
     """)
 
-    # Таблица личных сообщений (чат)
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS messages (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        sender_id INT NOT NULL,
-        receiver_id INT NOT NULL,
-        book_id INT NOT NULL,
-        message TEXT NOT NULL,
-        timestamp VARCHAR(100) NOT NULL,
-        FOREIGN KEY(sender_id) REFERENCES users(id) ON DELETE CASCADE,
-        FOREIGN KEY(receiver_id) REFERENCES users(id) ON DELETE CASCADE,
-        FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
-    ) ENGINE=InnoDB;
-    """)
+    # Messages table removed
 
     # Таблица предложений обмена книгами
     cursor.execute("""
@@ -657,54 +647,7 @@ def get_user_wishlist(user_id):
     conn.close()
     return rows
 
-# Messaging / Chat Operations
-def send_message(sender_id, receiver_id, book_id, message):
-    conn = get_connection()
-    cursor = conn.cursor()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute(
-        "INSERT INTO messages (sender_id, receiver_id, book_id, message, timestamp) VALUES (%s, %s, %s, %s, %s);",
-        (sender_id, receiver_id, book_id, message, now)
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-def get_chat_history(user1_id, user2_id, book_id):
-    conn = get_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("""
-        SELECT m.*, u_send.username as sender_name, u_rec.username as receiver_name
-        FROM messages m
-        JOIN users u_send ON m.sender_id = u_send.id
-        JOIN users u_rec ON m.receiver_id = u_rec.id
-        WHERE m.book_id = %s 
-          AND ((m.sender_id = %s AND m.receiver_id = %s) OR (m.sender_id = %s AND m.receiver_id = %s))
-        ORDER BY m.timestamp ASC;
-    """, (book_id, user1_id, user2_id, user2_id, user1_id))
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return rows
-
-def get_user_chats(user_id):
-    conn = get_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("""
-        SELECT DISTINCT 
-            m.book_id, 
-            b.title as book_title,
-            CASE WHEN m.sender_id = %s THEN m.receiver_id ELSE m.sender_id END as other_user_id,
-            u.username as other_username
-        FROM messages m
-        JOIN books b ON m.book_id = b.id
-        JOIN users u ON u.id = (CASE WHEN m.sender_id = %s THEN m.receiver_id ELSE m.sender_id END)
-        WHERE (m.sender_id = %s OR m.receiver_id = %s) AND u.is_admin = 0;
-    """, (user_id, user_id, user_id, user_id))
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return rows
+# Messaging / Chat Operations removed
 
 # Book Exchange operations
 def propose_exchange(proposer_id, receiver_id, proposer_book_id, receiver_book_id):

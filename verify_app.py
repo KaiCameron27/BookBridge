@@ -127,25 +127,7 @@ class TestBookBridgeDatabase(unittest.TestCase):
         fig_spend = analytics.generate_spending_chart(user['id'])
         self.assertIsNotNone(fig_spend)
 
-    def test_6_messaging_system(self):
-        """Verifies sending messages and reading chat history."""
-        user1 = db.verify_user("buyer_alice", "pass2")
-        user2 = db.verify_user("seller_bob", "pass1")
-        
-        books = db.get_available_books()
-        book_id = books[0]['id']
-        
-        db.send_message(user1['id'], user2['id'], book_id, "Hello! Is it available?")
-        db.send_message(user2['id'], user1['id'], book_id, "Yes, it is!")
-        
-        history = db.get_chat_history(user1['id'], user2['id'], book_id)
-        self.assertEqual(len(history), 2)
-        self.assertEqual(history[0]['message'], "Hello! Is it available?")
-        self.assertEqual(history[1]['message'], "Yes, it is!")
-        
-        chats = db.get_user_chats(user1['id'])
-        self.assertGreaterEqual(len(chats), 1)
-        self.assertEqual(chats[0]['other_username'], "seller_bob")
+
 
     def test_7_bonus_points(self):
         """Verifies that buying awards points and points can be redeemed for store cash."""

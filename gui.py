@@ -268,7 +268,6 @@ class DashboardScreen(tk.Frame):
             ("orders", "📦 My Orders"),
             ("listings", "🏷️ My Listings"),
             ("wishlist", "💖 Wishlist"),
-            ("messages", "💬 Chats"),
             ("exchanges", "🔄 Exchanges"),
             ("profile", "📊 Profile & Stats"),
         ]
@@ -318,8 +317,6 @@ class DashboardScreen(tk.Frame):
             self.current_content = ListingsView(self.content_area, self.controller)
         elif view_name == "wishlist":
             self.current_content = WishlistView(self.content_area, self.controller)
-        elif view_name == "messages":
-            self.current_content = MessagesView(self.content_area, self.controller)
         elif view_name == "exchanges":
             self.current_content = ExchangesView(self.content_area, self.controller)
         elif view_name == "profile":
@@ -753,13 +750,6 @@ class BookDetailsModal(tk.Toplevel):
         else:
             btn_buy = ModernButton(action_row, text="💳 Purchase Now", command=self.handle_purchase, bg=SUCCESS_COLOR, hover_bg="#059669")
         btn_buy.pack(side="right")
-        
-        # Chat Button (Only for other users' listings and not for admin listings)
-        if self.book['owner_id'] is not None:
-            owner = db.get_user_by_id(self.book['owner_id'])
-            if owner and owner.get('is_admin') != 1:
-                btn_chat = ModernButton(action_row, text="💬 Chat with Seller", command=self.open_chat, bg=BG_SURFACE_LIGHT, hover_bg=BORDER_COLOR)
-                btn_chat.pack(side="right", padx=10)
             
         # Full Description
         desc_card = tk.Frame(container, bg=BG_SURFACE, padx=20, pady=20, highlightbackground=BORDER_COLOR, highlightthickness=1)
@@ -861,10 +851,6 @@ class BookDetailsModal(tk.Toplevel):
     def handle_exchange(self):
         """Launches exchange selection popup."""
         ProposeExchangeModal(self, self.controller, self.book)
-
-    def open_chat(self):
-        """Launches messaging screen for this listing."""
-        ChatWindow(self, self.controller, self.book)
 
     def submit_review(self):
         comment = self.review_text.get().strip()
@@ -1347,251 +1333,7 @@ class WishlistView(tk.Frame):
         BookDetailsModal(self, self.controller, book_id, self.load_wishlist)
 
 
-# ==========================================
-# 6. MESSAGES VIEW (NEW)
-# ==========================================
-class MessagesView(tk.Frame):
-    """Workspace to view messaging threads and communicate directly with buyers/sellers."""
-    def __init__(self, parent, controller):
-        super().__init__(parent, bg=BG_DARK)
-        self.controller = controller
-        self.selected_chat = None  # Struct: (other_user_id, book_id, other_username, book_title)
-        self.last_length = 0
-        
-        # Grid splits: Left sidebar conversations, Right chat box
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_columnconfigure(1, weight=2)
-        self.grid_rowconfigure(0, weight=1)
-        
-        # Left Panel (Chat Lists)
-        self.left_panel = tk.Frame(self, bg=BG_SURFACE, highlightbackground=BORDER_COLOR, highlightthickness=1)
-        self.left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        
-        tk.Label(self.left_panel, text="💬 Active Chats", fg=TEXT_PRIMARY, bg=BG_SURFACE, font=FONT_SUBTITLE, anchor="w").pack(fill="x", padx=15, pady=15)
-        
-        self.chats_scroll = ScrollableFrame(self.left_panel)
-        self.chats_scroll.pack(fill="both", expand=True)
-        
-        # Right Panel (Chat History logs)
-        self.right_panel = tk.Frame(self, bg=BG_SURFACE, highlightbackground=BORDER_COLOR, highlightthickness=1)
-        self.right_panel.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        
-        self.chat_title = tk.Label(
-            self.right_panel, 
-            text="Select a conversation thread to start chatting", 
-            fg=TEXT_SECONDARY, 
-            bg=BG_SURFACE, 
-            font=FONT_SUBTITLE, 
-            anchor="w",
-            wraplength=450
-        )
-        self.chat_title.pack(fill="x", padx=15, pady=15)
-        
-        self.msg_scroll = ScrollableFrame(self.right_panel)
-        self.msg_scroll.pack(fill="both", expand=True, padx=15)
-        
-        # Message input footer
-        self.input_frame = tk.Frame(self.right_panel, bg=BG_SURFACE, pady=10)
-        self.msg_entry = tk.Entry(
-            self.input_frame, 
-            bg=BG_SURFACE_LIGHT, 
-            fg=TEXT_PRIMARY, 
-            relief="flat", 
-            font=FONT_BODY,
-            insertbackground=TEXT_PRIMARY
-        )
-        self.msg_entry.pack(side="left", fill="x", expand=True, padx=(15, 10), pady=5)
-        self.msg_entry.bind("<Return>", lambda e: self.send_message())
-        
-        self.btn_send = ModernButton(self.input_frame, text="Send", command=self.send_message, bg=ACCENT_PURPLE, hover_bg=ACCENT_PURPLE_HOVER, width=8)
-        self.btn_send.pack(side="right", padx=(0, 15))
-        
-        self.load_conversations()
-
-    def load_conversations(self):
-        for child in self.chats_scroll.scrollable_frame.winfo_children():
-            child.destroy()
-            
-        chats = db.get_user_chats(self.controller.current_user['id'])
-        if not chats:
-            tk.Label(self.chats_scroll.scrollable_frame, text="No active messages yet.", fg=TEXT_SECONDARY, bg=BG_DARK, font=FONT_CAPTION_MUTED).pack(pady=20)
-            return
-            
-        for ch in chats:
-            self.draw_chat_item(self.chats_scroll.scrollable_frame, ch)
-
-    def draw_chat_item(self, parent, ch):
-        item = tk.Frame(parent, bg=BG_SURFACE, highlightbackground=BORDER_COLOR, highlightthickness=1)
-        item.pack(fill="x", pady=4, padx=5)
-        
-        btn = tk.Label(
-            item, 
-            text=f"👤 {ch['other_username']}\n📚 {ch['book_title']}", 
-            fg=TEXT_PRIMARY, 
-            bg=BG_SURFACE, 
-            font=FONT_BODY, 
-            justify="left",
-            anchor="w",
-            cursor="hand2",
-            padx=10,
-            pady=8
-        )
-        btn.pack(fill="both", expand=True)
-        btn.bind("<Button-1>", lambda event, c=ch: self.select_conversation(c))
-
-    def select_conversation(self, c):
-        self.selected_chat = c
-        self.chat_title.configure(text=f"Chatting with 👤 {c['other_username']}  |  Book: {c['book_title']}", fg=TEXT_PRIMARY)
-        
-        # Display input frame
-        self.input_frame.pack(fill="x", side="bottom")
-        
-        # Add a refresh indicator
-        btn_refresh = ModernButton(self.right_panel, text="🔄 Refresh", command=self.load_messages, bg=BG_SURFACE_LIGHT, hover_bg=BORDER_COLOR, padding=(8, 2))
-        btn_refresh.place(relx=0.95, rely=0.03, anchor="ne")
-        
-        self.load_messages()
-
-    def load_messages(self):
-        if not self.selected_chat:
-            return
-            
-        for child in self.msg_scroll.scrollable_frame.winfo_children():
-            child.destroy()
-            
-        history = db.get_chat_history(
-            user1_id=self.controller.current_user['id'],
-            user2_id=self.selected_chat['other_user_id'],
-            book_id=self.selected_chat['book_id']
-        )
-        
-        container = self.msg_scroll.scrollable_frame
-        for msg in history:
-            is_me = msg['sender_id'] == self.controller.current_user['id']
-            align = "e" if is_me else "w"
-            bg = ACCENT_PURPLE if is_me else BG_SURFACE_LIGHT
-            text_color = "white" if is_me else TEXT_PRIMARY
-            
-            row = tk.Frame(container, bg=BG_DARK)
-            row.pack(fill="x", pady=4)
-            
-            bubble_frame = tk.Frame(row, bg=bg, padx=12, pady=8)
-            bubble_frame.pack(side="right" if is_me else "left", padx=10)
-            
-            msg_lbl = tk.Label(
-                bubble_frame, 
-                text=msg['message'], 
-                fg=text_color, 
-                bg=bg, 
-                font=FONT_BODY,
-                wraplength=350,
-                justify="left"
-            )
-            msg_lbl.pack()
-            
-            ts_lbl = tk.Label(
-                row, 
-                text=msg['timestamp'].split()[-1], # Just show time HH:MM
-                fg=TEXT_SECONDARY, 
-                bg=BG_DARK, 
-                font=FONT_CAPTION
-            )
-            ts_lbl.pack(side="right" if is_me else "left", padx=5, pady=5)
-            
-        # Scroll to bottom
-        self.msg_scroll.canvas.update_idletasks()
-        self.msg_scroll.canvas.yview_moveto(1.0)
-
-    def send_message(self):
-        text = self.msg_entry.get().strip()
-        if not text or not self.selected_chat:
-            return
-            
-        db.send_message(
-            sender_id=self.controller.current_user['id'],
-            receiver_id=self.selected_chat['other_user_id'],
-            book_id=self.selected_chat['book_id'],
-            message=text
-        )
-        self.msg_entry.delete(0, tk.END)
-        self.load_messages()
-
-
-class ChatWindow(tk.Toplevel):
-    """Floating pop-up window directly initialized from book details to send first message."""
-    def __init__(self, parent, controller, book):
-        super().__init__(parent)
-        self.controller = controller
-        self.book = book
-        self.title(f"Chat about '{book['title']}'")
-        self.geometry("450x500")
-        self.configure(bg=BG_DARK)
-        self.transient(parent)
-        self.grab_set()
-        
-        # Header
-        header = tk.Frame(self, bg=BG_SURFACE, pady=10, padx=15)
-        header.pack(fill="x")
-        tk.Label(header, text=f"💬 Chatting with Seller ID: {book['owner_id']}", fg=TEXT_PRIMARY, bg=BG_SURFACE, font=FONT_BODY_BOLD).pack(anchor="w")
-        tk.Label(header, text=f"Regarding: {book['title']} (${book['price']:.2f})", fg=TEXT_SECONDARY, bg=BG_SURFACE, font=FONT_CAPTION).pack(anchor="w")
-        
-        # Scroll Box
-        self.msg_scroll = ScrollableFrame(self)
-        self.msg_scroll.pack(fill="both", expand=True, padx=15, pady=10)
-        
-        # Footer
-        self.input_frame = tk.Frame(self, bg=BG_SURFACE, pady=10)
-        self.input_frame.pack(fill="x", side="bottom")
-        
-        self.msg_entry = tk.Entry(self.input_frame, bg=BG_SURFACE_LIGHT, fg=TEXT_PRIMARY, relief="flat", font=FONT_BODY, insertbackground=TEXT_PRIMARY)
-        self.msg_entry.pack(side="left", fill="x", expand=True, padx=(15, 10), pady=5)
-        self.msg_entry.bind("<Return>", lambda e: self.send_message())
-        
-        btn_send = ModernButton(self.input_frame, text="Send", command=self.send_message, bg=ACCENT_PURPLE, hover_bg=ACCENT_PURPLE_HOVER, width=8)
-        btn_send.pack(side="right", padx=(0, 15))
-        
-        self.load_messages()
-
-    def load_messages(self):
-        for child in self.msg_scroll.scrollable_frame.winfo_children():
-            child.destroy()
-            
-        history = db.get_chat_history(
-            user1_id=self.controller.current_user['id'],
-            user2_id=self.book['owner_id'],
-            book_id=self.book['id']
-        )
-        
-        container = self.msg_scroll.scrollable_frame
-        for msg in history:
-            is_me = msg['sender_id'] == self.controller.current_user['id']
-            bg = ACCENT_PURPLE if is_me else BG_SURFACE_LIGHT
-            align = "right" if is_me else "left"
-            
-            row = tk.Frame(container, bg=BG_DARK)
-            row.pack(fill="x", pady=4)
-            
-            bubble = tk.Frame(row, bg=bg, padx=12, pady=8)
-            bubble.pack(side=align, padx=10)
-            
-            tk.Label(bubble, text=msg['message'], fg="white" if is_me else TEXT_PRIMARY, bg=bg, font=FONT_BODY, wraplength=250, justify="left").pack()
-            
-        self.msg_scroll.canvas.update_idletasks()
-        self.msg_scroll.canvas.yview_moveto(1.0)
-
-    def send_message(self):
-        text = self.msg_entry.get().strip()
-        if not text:
-            return
-            
-        db.send_message(
-            sender_id=self.controller.current_user['id'],
-            receiver_id=self.book['owner_id'],
-            book_id=self.book['id'],
-            message=text
-        )
-        self.msg_entry.delete(0, tk.END)
-        self.load_messages()
+# 6. MESSAGES VIEW AND CHAT WINDOW DELETED
 
 
 # ==========================================
