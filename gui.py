@@ -745,11 +745,14 @@ class BookDetailsModal(tk.Toplevel):
         self.btn_wish.pack(side="right", padx=10)
         
         # Choose checkout button depending on listing type
-        if self.book['listing_type'] == 'Exchange':
-            btn_buy = ModernButton(action_row, text="🔄 Propose Exchange", command=self.handle_exchange, bg=ACCENT_PURPLE, hover_bg=ACCENT_PURPLE_HOVER)
+        if self.book['owner_id'] != self.controller.current_user['id']:
+            if self.book['listing_type'] == 'Exchange':
+                btn_buy = ModernButton(action_row, text="🔄 Propose Exchange", command=self.handle_exchange, bg=ACCENT_PURPLE, hover_bg=ACCENT_PURPLE_HOVER)
+            else:
+                btn_buy = ModernButton(action_row, text="💳 Purchase Now", command=self.handle_purchase, bg=SUCCESS_COLOR, hover_bg="#059669")
+            btn_buy.pack(side="right")
         else:
-            btn_buy = ModernButton(action_row, text="💳 Purchase Now", command=self.handle_purchase, bg=SUCCESS_COLOR, hover_bg="#059669")
-        btn_buy.pack(side="right")
+            tk.Label(action_row, text="🏷️ This is your listing", fg=ACCENT_BLUE, bg=BG_SURFACE, font=FONT_BODY_BOLD).pack(side="right")
             
         # Full Description
         desc_card = tk.Frame(container, bg=BG_SURFACE, padx=20, pady=20, highlightbackground=BORDER_COLOR, highlightthickness=1)
@@ -826,27 +829,7 @@ class BookDetailsModal(tk.Toplevel):
             self.btn_wish.bg = ACCENT_BLUE
 
     def handle_purchase(self):
-        self.controller.refresh_user_data()
-        buyer = self.controller.current_user
-        
-        # Confirm prompt
-        shipping_desc = "instantly via digital delivery" if self.book['format'] != 'Paper' else f"to your address:\n{buyer['address']}"
-        confirm = messagebox.askyesno(
-            "Confirm Purchase", 
-            f"Are you sure you want to buy '{self.book['title']}' for ${self.book['price']:.2f}?\n\nIt will be delivered {shipping_desc}."
-        )
-        
-        if confirm:
-            try:
-                success = db.buy_book(buyer['id'], self.book_id, buyer['address'])
-                if success:
-                    # Calculate points earned (equivalent to 1 point per 1000 UZS)
-                    pts = int(self.book['price'] * 12.5)
-                    self.controller.show_toast(f"Purchase successful! +{pts} bonus points earned!")
-                    self.refresh_callback()
-                    self.destroy()
-            except Exception as e:
-                self.controller.show_toast(str(e), is_error=True)
+        CheckoutModal(self, self.controller, self.book, self.refresh_callback)
 
     def handle_exchange(self):
         """Launches exchange selection popup."""
@@ -1091,7 +1074,12 @@ class OrdersView(tk.Frame):
         badge.pack(side="right")
         
         # Address
-        tk.Label(card, text=f"📍 Delivery Address: {tx['delivery_address']}", fg=TEXT_SECONDARY, bg=BG_SURFACE, font=FONT_CAPTION, anchor="w").pack(fill="x", pady=(0, 10))
+        tk.Label(card, text=f"📍 Delivery Address: {tx['delivery_address']}", fg=TEXT_SECONDARY, bg=BG_SURFACE, font=FONT_CAPTION, anchor="w").pack(fill="x", pady=(0, 4))
+        
+        # Payment Method details
+        pay_method = tx.get('payment_method', 'Balance')
+        card_info = f" ({tx['card_details']})" if tx.get('card_details') else ""
+        tk.Label(card, text=f"💳 Payment Method: {pay_method}{card_info}", fg=TEXT_SECONDARY, bg=BG_SURFACE, font=FONT_CAPTION, anchor="w").pack(fill="x", pady=(0, 10))
         
         # Tracking Timeline Box
         tracking_box = tk.Frame(card, bg=BG_DARK, padx=12, pady=10)
@@ -1334,6 +1322,163 @@ class WishlistView(tk.Frame):
 
 
 # 6. MESSAGES VIEW AND CHAT WINDOW DELETED
+
+# ==========================================
+# CHECKOUT MODAL
+# ==========================================
+class CheckoutModal(tk.Toplevel):
+    """Modal dialog for choosing payment method and specifying delivery details."""
+    def __init__(self, parent, controller, book, refresh_callback):
+        super().__init__(parent)
+        self.controller = controller
+        self.book = book
+        self.refresh_callback = refresh_callback
+        
+        self.title("Checkout - BookBridge")
+        self.geometry("480x640")
+        self.configure(bg=BG_DARK)
+        self.transient(parent)
+        self.grab_set()
+        
+        # Header Info
+        header_frame = tk.Frame(self, bg=BG_SURFACE, padx=20, pady=15, highlightbackground=BORDER_COLOR, highlightthickness=1)
+        header_frame.pack(fill="x", padx=20, pady=(15, 10))
+        
+        tk.Label(header_frame, text="Order Summary", fg=TEXT_SECONDARY, bg=BG_SURFACE, font=FONT_CAPTION, anchor="w").pack(fill="x")
+        tk.Label(header_frame, text=book['title'], fg=TEXT_PRIMARY, bg=BG_SURFACE, font=FONT_SUBTITLE, anchor="w").pack(fill="x", pady=2)
+        tk.Label(header_frame, text=f"by {book['author']}  |  Format: {book['format']}", fg=TEXT_SECONDARY, bg=BG_SURFACE, font=FONT_CAPTION, anchor="w").pack(fill="x")
+        
+        price_row = tk.Frame(header_frame, bg=BG_SURFACE)
+        price_row.pack(fill="x", pady=(8, 0))
+        tk.Label(price_row, text="Total Amount:", fg=TEXT_PRIMARY, bg=BG_SURFACE, font=FONT_BODY_BOLD).pack(side="left")
+        tk.Label(price_row, text=f"${book['price']:.2f}", fg=ACCENT_PURPLE, bg=BG_SURFACE, font=FONT_SUBTITLE).pack(side="right")
+        
+        # Form scroll
+        self.scroll = ScrollableFrame(self)
+        self.scroll.pack(fill="both", expand=True, padx=20, pady=10)
+        form = self.scroll.scrollable_frame
+        
+        # Delivery Address
+        self.addr_input = ModernInput(form, label_text="Delivery Address", placeholder="e.g. 123 Main St, New York")
+        self.addr_input.pack(fill="x", pady=8)
+        self.addr_input.set(self.controller.current_user['address'])
+        
+        # Payment Method Dropdown
+        tk.Label(form, text="Payment Method", fg=TEXT_SECONDARY, bg=BG_DARK, font=FONT_CAPTION, anchor="w").pack(fill="x", pady=(10, 2))
+        
+        self.pay_method_var = tk.StringVar(value="Wallet Balance")
+        
+        self.pay_method_drop = ttk.Combobox(
+            form, 
+            textvariable=self.pay_method_var, 
+            values=["Wallet Balance", "Credit Card", "Cash on Delivery"], 
+            state="readonly"
+        )
+        self.pay_method_drop.pack(fill="x", pady=(0, 10))
+        self.pay_method_drop.bind("<<ComboboxSelected>>", self.on_payment_method_change)
+        
+        # Credit Card Form Container (dynamic)
+        self.card_frame = tk.Frame(form, bg=BG_SURFACE, padx=15, pady=15, highlightbackground=BORDER_COLOR, highlightthickness=1)
+        
+        self.cardholder_input = ModernInput(self.card_frame, label_text="Cardholder Name", placeholder="e.g. John Doe")
+        self.cardholder_input.pack(fill="x", pady=4)
+        
+        self.cardno_input = ModernInput(self.card_frame, label_text="Card Number", placeholder="e.g. 1111222233334444")
+        self.cardno_input.pack(fill="x", pady=4)
+        
+        expiry_cvv = tk.Frame(self.card_frame, bg=BG_SURFACE)
+        expiry_cvv.pack(fill="x", pady=4)
+        expiry_cvv.columnconfigure(0, weight=1)
+        expiry_cvv.columnconfigure(1, weight=1)
+        
+        self.expiry_input = ModernInput(expiry_cvv, label_text="Expiry Date (MM/YY)", placeholder="MM/YY")
+        self.expiry_input.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        
+        self.cvv_input = ModernInput(expiry_cvv, label_text="CVV", placeholder="e.g. 123")
+        self.cvv_input.grid(row=0, column=1, padx=(5, 0), sticky="ew")
+        
+        # Action Button
+        self.btn_pay = ModernButton(
+            self, 
+            text=f"Confirm & Pay ${book['price']:.2f}", 
+            command=self.process_payment, 
+            bg=SUCCESS_COLOR, 
+            hover_bg="#059669"
+        )
+        self.btn_pay.pack(fill="x", padx=20, pady=(10, 20))
+
+    def on_payment_method_change(self, event):
+        method = self.pay_method_var.get()
+        if method == "Credit Card":
+            self.card_frame.pack(fill="x", pady=10)
+            self.btn_pay.configure_text(f"Pay ${self.book['price']:.2f} via Card")
+        elif method == "Cash on Delivery":
+            self.card_frame.pack_forget()
+            self.btn_pay.configure_text("Place COD Order")
+        else:
+            self.card_frame.pack_forget()
+            self.btn_pay.configure_text(f"Pay ${self.book['price']:.2f} from Balance")
+
+    def process_payment(self):
+        self.controller.refresh_user_data()
+        buyer = self.controller.current_user
+        
+        address = self.addr_input.get().strip()
+        if not address:
+            self.controller.show_toast("Please enter a delivery address.", is_error=True)
+            return
+            
+        method = self.pay_method_var.get()
+        db_method = "Balance"
+        card_details = None
+        
+        if method == "Credit Card":
+            db_method = "Card"
+            cardholder = self.cardholder_input.get().strip()
+            cardno = self.cardno_input.get().strip()
+            expiry = self.expiry_input.get().strip()
+            cvv = self.cvv_input.get().strip()
+            
+            if not cardholder or not cardno or not expiry or not cvv:
+                self.controller.show_toast("Please fill in all credit card details.", is_error=True)
+                return
+                
+            # Basic validation
+            import re
+            if not re.match(r"^\d{16}$", cardno):
+                self.controller.show_toast("Card number must be exactly 16 digits.", is_error=True)
+                return
+            if not re.match(r"^\d{2}/\d{2}$", expiry):
+                self.controller.show_toast("Expiry must be in MM/YY format.", is_error=True)
+                return
+            if not re.match(r"^\d{3}$", cvv):
+                self.controller.show_toast("CVV must be exactly 3 digits.", is_error=True)
+                return
+                
+            card_details = f"Card ending in {cardno[-4:]}"
+            
+        elif method == "Cash on Delivery":
+            db_method = "Cash on Delivery"
+            
+        else:
+            db_method = "Balance"
+            if buyer['balance'] < self.book['price']:
+                self.controller.show_toast("Insufficient wallet balance. Top up your profile or choose another payment method.", is_error=True)
+                return
+                
+        try:
+            success = db.buy_book(buyer['id'], self.book['id'], address, db_method, card_details)
+            if success:
+                pts = int(self.book['price'] * 12.5)
+                self.controller.show_toast(f"Purchase successful! +{pts} bonus points earned!")
+                self.refresh_callback()
+                
+                # Check if the parent of parent is BookDetailsModal, destroy that too!
+                if hasattr(self.master, "destroy"):
+                    self.master.destroy()
+                self.destroy()
+        except Exception as e:
+            self.controller.show_toast(str(e), is_error=True)
 
 
 # ==========================================
@@ -2670,10 +2815,15 @@ class AdminTrackingModal(tk.Toplevel):
         box.pack(fill="both", expand=True, padx=20, pady=(0, 20))
         
         # Meta info
+        pay_info = self.tx.get('payment_method', 'Balance')
+        if self.tx.get('card_details'):
+            pay_info += f" ({self.tx['card_details']})"
+            
         info_lines = [
             ("Book Item:", self.tx['book_title']),
             ("Deliver To:", self.tx['delivery_address']),
             ("Order Date:", self.tx['date']),
+            ("Payment:", pay_info),
             ("Current Status:", self.tx['status'].upper())
         ]
         for lbl, val in info_lines:

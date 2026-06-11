@@ -95,11 +95,23 @@ def init_db():
         delivery_address TEXT NOT NULL,
         date VARCHAR(100) NOT NULL,
         tracking_info TEXT NOT NULL,
+        payment_method VARCHAR(50) DEFAULT 'Balance',
+        card_details VARCHAR(255) NULL,
         FOREIGN KEY(buyer_id) REFERENCES users(id) ON DELETE RESTRICT,
         FOREIGN KEY(seller_id) REFERENCES users(id) ON DELETE SET NULL,
         FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE RESTRICT
     ) ENGINE=InnoDB;
     """)
+
+    # Migration for transactions table (if existing database doesn't have columns)
+    try:
+        cursor.execute("ALTER TABLE transactions ADD COLUMN payment_method VARCHAR(50) DEFAULT 'Balance';")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE transactions ADD COLUMN card_details VARCHAR(255) NULL;")
+    except Exception:
+        pass
 
     # Таблица отзывов
     cursor.execute("""
@@ -442,7 +454,7 @@ def get_book_by_id(book_id):
     conn.close()
     return row
 
-def buy_book(buyer_id, book_id, address):
+def buy_book(buyer_id, book_id, address, payment_method='Balance', card_details=None):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
     
@@ -458,27 +470,54 @@ def buy_book(buyer_id, book_id, address):
             raise Exception("Buyer not found.")
             
         price = book['price']
-        if buyer['balance'] < price:
-            raise Exception("Insufficient funds. Please top up your balance in your profile.")
-            
-        new_buyer_balance = buyer['balance'] - price
-        points_earned = int(price * 12.5)  # 1 USD = 12.5 баллов (1000 UZS = 1 балл)
-        new_points = buyer['points'] + points_earned
         
-        cursor.execute(
-            "UPDATE users SET balance = %s, points = %s WHERE id = %s;",
-            (new_buyer_balance, new_points, buyer_id)
-        )
-        
-        seller_id = book['owner_id']
-        if seller_id:
-            cursor.execute("SELECT balance FROM users WHERE id = %s;", (seller_id,))
-            seller = cursor.fetchone()
-            if seller:
-                new_seller_balance = seller['balance'] + price
-                cursor.execute("UPDATE users SET balance = %s WHERE id = %s;", (new_seller_balance, seller_id))
+        # Payment Method Logic
+        if payment_method == 'Balance':
+            if buyer['balance'] < price:
+                raise Exception("Insufficient funds. Please top up your balance in your profile.")
                 
-        if seller_id is not None:
+            new_buyer_balance = buyer['balance'] - price
+            points_earned = int(price * 12.5)  # 1 USD = 12.5 points
+            new_points = buyer['points'] + points_earned
+            
+            cursor.execute(
+                "UPDATE users SET balance = %s, points = %s WHERE id = %s;",
+                (new_buyer_balance, new_points, buyer_id)
+            )
+            
+            seller_id = book['owner_id']
+            if seller_id:
+                cursor.execute("SELECT balance FROM users WHERE id = %s;", (seller_id,))
+                seller = cursor.fetchone()
+                if seller:
+                    new_seller_balance = seller['balance'] + price
+                    cursor.execute("UPDATE users SET balance = %s WHERE id = %s;", (new_seller_balance, seller_id))
+        
+        elif payment_method == 'Card':
+            # Card purchases award points but do not deduct balance
+            points_earned = int(price * 12.5)
+            new_points = buyer['points'] + points_earned
+            cursor.execute("UPDATE users SET points = %s WHERE id = %s;", (new_points, buyer_id))
+            
+            seller_id = book['owner_id']
+            if seller_id:
+                cursor.execute("SELECT balance FROM users WHERE id = %s;", (seller_id,))
+                seller = cursor.fetchone()
+                if seller:
+                    new_seller_balance = seller['balance'] + price
+                    cursor.execute("UPDATE users SET balance = %s WHERE id = %s;", (new_seller_balance, seller_id))
+                    
+        elif payment_method == 'Cash on Delivery':
+            # Cash on delivery: no balance subtraction, points awarded, seller credited only when Delivered
+            points_earned = int(price * 12.5)
+            new_points = buyer['points'] + points_earned
+            cursor.execute("UPDATE users SET points = %s WHERE id = %s;", (new_points, buyer_id))
+            # Balance addition for COD seller is handled in update_transaction_status
+            
+        else:
+            raise Exception(f"Unsupported payment method: {payment_method}")
+            
+        if book['owner_id'] is not None:
             cursor.execute("UPDATE books SET is_sold = 1 WHERE id = %s;", (book_id,))
         
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -491,10 +530,17 @@ def buy_book(buyer_id, book_id, address):
         else:
             tracking_info += f"{now} - Preparing for shipment.\n"
             
-        cursor.execute(
-            "INSERT INTO transactions (buyer_id, seller_id, book_id, price, status, delivery_address, date, tracking_info) VALUES (%s, %s, %s, %s, %s, %s, %s, %s);",
-            (buyer_id, seller_id, book_id, price, status, address, now, tracking_info)
-        )
+        cursor.execute("""
+            INSERT INTO transactions (buyer_id, seller_id, book_id, price, status, delivery_address, date, tracking_info, payment_method, card_details)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+        """, (buyer_id, book['owner_id'], book_id, price, status, address, now, tracking_info, payment_method, card_details))
+        
+        # Auto-reject any pending exchange proposals involving this book
+        cursor.execute("""
+            UPDATE exchanges 
+            SET status = 'Rejected' 
+            WHERE status = 'Pending' AND (proposer_book_id = %s OR receiver_book_id = %s);
+        """, (book_id, book_id))
         
         conn.commit()
         return True
@@ -551,15 +597,30 @@ def update_transaction_status(transaction_id, status, tracking_note):
     cursor = conn.cursor(dictionary=True)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    cursor.execute("SELECT tracking_info FROM transactions WHERE id = %s;", (transaction_id,))
-    row = cursor.fetchone()
-    if row:
-        current_tracking = row['tracking_info']
+    cursor.execute("SELECT * FROM transactions WHERE id = %s;", (transaction_id,))
+    tx = cursor.fetchone()
+    if tx:
+        old_status = tx['status']
+        price = tx['price']
+        seller_id = tx['seller_id']
+        payment_method = tx.get('payment_method', 'Balance')
+        
+        current_tracking = tx['tracking_info']
         new_tracking = current_tracking + f"{now} - {tracking_note}\n"
         cursor.execute(
             "UPDATE transactions SET status = %s, tracking_info = %s WHERE id = %s;",
             (status, new_tracking, transaction_id)
         )
+        
+        # Credit seller if COD order reaches Delivered status
+        if status == 'Delivered' and old_status != 'Delivered' and payment_method == 'Cash on Delivery':
+            if seller_id:
+                cursor.execute("SELECT balance FROM users WHERE id = %s;", (seller_id,))
+                seller = cursor.fetchone()
+                if seller:
+                    new_seller_balance = seller['balance'] + price
+                    cursor.execute("UPDATE users SET balance = %s WHERE id = %s;", (new_seller_balance, seller_id))
+                    
         conn.commit()
     cursor.close()
     conn.close()
@@ -756,16 +817,16 @@ def respond_to_exchange(exchange_id, status):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         tx_info1 = f"{now} - Exchange agreed. Owners swapped.\n"
-        cursor.execute(
-            "INSERT INTO transactions (buyer_id, seller_id, book_id, price, status, delivery_address, date, tracking_info) VALUES (%s, %s, %s, %s, %s, %s, %s, %s);",
-            (receiver_id, proposer_id, prop_book_id, 0.0, 'Delivered', 'Exchange Swap', now, tx_info1)
-        )
+        cursor.execute("""
+            INSERT INTO transactions (buyer_id, seller_id, book_id, price, status, delivery_address, date, tracking_info, payment_method)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+        """, (receiver_id, proposer_id, prop_book_id, 0.0, 'Delivered', 'Exchange Swap', now, tx_info1, 'Exchange'))
         
         tx_info2 = f"{now} - Exchange agreed. Owners swapped.\n"
-        cursor.execute(
-            "INSERT INTO transactions (buyer_id, seller_id, book_id, price, status, delivery_address, date, tracking_info) VALUES (%s, %s, %s, %s, %s, %s, %s, %s);",
-            (proposer_id, receiver_id, rec_book_id, 0.0, 'Delivered', 'Exchange Swap', now, tx_info2)
-        )
+        cursor.execute("""
+            INSERT INTO transactions (buyer_id, seller_id, book_id, price, status, delivery_address, date, tracking_info, payment_method)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+        """, (proposer_id, receiver_id, rec_book_id, 0.0, 'Delivered', 'Exchange Swap', now, tx_info2, 'Exchange'))
         
         conn.commit()
     except Exception as e:

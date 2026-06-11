@@ -259,6 +259,65 @@ class TestBookBridgeDatabase(unittest.TestCase):
         self.assertEqual(my_tx_after[0]['status'], "Shipped")
         self.assertIn("Shipped by admin courier service.", my_tx_after[0]['tracking_info'])
 
+        # Test payment methods: Card and COD
+        test_seller_id = db.add_user("test_seller", "pass", "seller@test.com", "Seller Address")
+        buyer_card = db.add_user("buyer_card", "pass", "card@test.com", "Card Address")
+        book_card = db.add_book("Card Book", "Author", "D", 50.00, "English", "Fiction", test_seller_id)
+        
+        # Buy with Card
+        success_card = db.buy_book(buyer_card, book_card, "Card Address", "Card", "Card ending in 1111")
+        self.assertTrue(success_card)
+        buyer_card_obj = db.get_user_by_id(buyer_card)
+        self.assertEqual(buyer_card_obj['balance'], 100.00) # unchanged
+        self.assertEqual(buyer_card_obj['points'], 625) # points awarded
+        
+        # Buy with COD
+        buyer_cod = db.add_user("buyer_cod", "pass", "cod@test.com", "COD Address")
+        book_cod = db.add_book("COD Book", "Author", "D", 30.00, "English", "Fiction", test_seller_id)
+        
+        # Initially seller balance
+        seller_before = db.get_user_by_id(test_seller_id)
+        
+        success_cod = db.buy_book(buyer_cod, book_cod, "COD Address", "Cash on Delivery")
+        self.assertTrue(success_cod)
+        
+        # Seller balance should not be increased yet
+        seller_after_buy = db.get_user_by_id(test_seller_id)
+        self.assertEqual(seller_after_buy['balance'], seller_before['balance'])
+        
+        # Get transaction id
+        txs = db.admin_get_all_transactions()
+        cod_tx = [t for t in txs if t['buyer_name'] == "buyer_cod"][0]
+        
+        # Set to Delivered
+        db.update_transaction_status(cod_tx['id'], "Delivered", "Delivered on door step.")
+        
+        # Now seller balance should increase by 30
+        seller_after_deliver = db.get_user_by_id(test_seller_id)
+        self.assertEqual(seller_after_deliver['balance'], seller_before['balance'] + 30.00)
+
+        # Test exchange proposals sync on standard buy
+        user_c = db.add_user("user_c", "pass", "c@test.com", "Loc C")
+        user_d = db.add_user("user_d", "pass", "d@test.com", "Loc D")
+        book_c = db.add_book("Book C", "Author C", "D1", 10.00, "English", "Fiction", user_c, listing_type="Exchange", wanted_book="Book D")
+        book_d = db.add_book("Book D", "Author D", "D2", 10.00, "English", "Fiction", user_d, listing_type="Exchange", wanted_book="Book C")
+        
+        db.propose_exchange(user_c, user_d, book_c, book_d)
+        
+        props_before = db.get_received_exchange_proposals(user_d)
+        self.assertEqual(len(props_before), 1)
+        self.assertEqual(props_before[0]['status'], 'Pending')
+        
+        # Purchase book_c via standard buy flow
+        db.buy_book(user_d, book_c, "Loc D", "Balance")
+        
+        # The proposal should now be auto-rejected
+        props_after = db.get_received_exchange_proposals(user_d)
+        self.assertEqual(len(props_after), 0) # Pending proposals only
+        
+        sent_props = db.get_sent_exchange_proposals(user_c)
+        self.assertEqual(sent_props[0]['status'], 'Rejected')
+
 if __name__ == "__main__":
     print("Running automated verification tests for BookBridge Phase 2 on MySQL...")
     unittest.main()

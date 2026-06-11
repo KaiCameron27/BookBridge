@@ -206,14 +206,14 @@ class ScrollableFrame(tk.Frame):
 class StarRating(tk.Frame):
     """A rating display that renders filled/empty stars (★ / ☆)."""
     def __init__(self, parent, rating=0, interactive=False, on_change=None, size=12, **kwargs):
-        super().__init__(parent, bg=BG_DARK, **kwargs)
+        self.bg_color = kwargs.pop("bg", BG_DARK)
+        super().__init__(parent, bg=self.bg_color, **kwargs)
         self.rating = round(rating)
         self.interactive = interactive
         self.on_change = on_change
         self.size = size
         self.stars = []
         
-        self.bg_color = kwargs.get("bg", BG_DARK)
         self.configure(bg=self.bg_color)
         
         self.render_stars()
