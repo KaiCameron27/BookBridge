@@ -1326,6 +1326,91 @@ class WishlistView(tk.Frame):
 # ==========================================
 # CHECKOUT MODAL
 # ==========================================
+# ==========================================
+# STRIPE CALLBACK SERVER & CHECKOUT MODAL
+# ==========================================
+import http.server
+import urllib.parse
+import threading
+import os
+import webbrowser
+
+class StripeCallbackHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+        
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        
+        if parsed.path == "/success":
+            session_id = params.get("session_id", [None])[0]
+            if session_id:
+                import stripe
+                import database as db
+                api_key = os.environ.get("STRIPE_API_KEY")
+                if api_key:
+                    stripe.api_key = api_key
+                    try:
+                        session = stripe.checkout.Session.retrieve(session_id)
+                        if session.payment_status == "paid":
+                            success = db.confirm_stripe_payment(session_id)
+                            if success:
+                                self.send_response(200)
+                                self.send_header("Content-type", "text/html; charset=utf-8")
+                                self.end_headers()
+                                self.wfile.write("""
+                                    <html>
+                                    <head>
+                                        <title>Payment Successful</title>
+                                        <style>
+                                            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #F1F5F9; color: #0F172A; text-align: center; padding-top: 100px; }
+                                            .card { background: white; max-width: 500px; margin: 0 auto; padding: 40px; border-radius: 8px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); }
+                                            h1 { color: #10B981; }
+                                            p { font-size: 16px; line-height: 1.5; color: #64748B; }
+                                        </style>
+                                    </head>
+                                    <body>
+                                        <div class="card">
+                                            <h1>✨ Payment Successful!</h1>
+                                            <p>Thank you for your purchase on BookBridge.</p>
+                                            <p>Your payment has been securely verified by Stripe. You can now close this tab and return to the desktop application.</p>
+                                        </div>
+                                    </body>
+                                    </html>
+                                """.encode("utf-8"))
+                                if self.server.checkout_modal:
+                                    self.server.checkout_modal.stripe_success_callback()
+                                return
+                    except Exception:
+                        pass
+        elif parsed.path == "/cancel":
+            self.send_response(200)
+            self.send_header("Content-type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("""
+                <html>
+                <body style="font-family: sans-serif; text-align: center; padding-top: 100px; background-color: #F1F5F9; color: #0F172A;">
+                    <h2>Payment Cancelled</h2>
+                    <p>You cancelled the payment. You can return to BookBridge to try again.</p>
+                </body>
+                </html>
+            """.encode("utf-8"))
+            if self.server.checkout_modal:
+                self.server.checkout_modal.stripe_cancel_callback()
+            return
+                        
+        self.send_response(400)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Invalid Stripe payment session or payment cancelled.")
+
+class StripeCallbackServer(http.server.HTTPServer):
+    def __init__(self, server_address, RequestHandlerClass, checkout_modal):
+        super().__init__(server_address, RequestHandlerClass)
+        self.checkout_modal = checkout_modal
+
+
 class CheckoutModal(tk.Toplevel):
     """Modal dialog for choosing payment method and specifying delivery details."""
     def __init__(self, parent, controller, book, refresh_callback):
@@ -1333,6 +1418,8 @@ class CheckoutModal(tk.Toplevel):
         self.controller = controller
         self.book = book
         self.refresh_callback = refresh_callback
+        self.server = None
+        self.server_thread = None
         
         self.title("Checkout - BookBridge")
         self.geometry("480x640")
@@ -1377,7 +1464,7 @@ class CheckoutModal(tk.Toplevel):
         self.pay_method_drop.pack(fill="x", pady=(0, 10))
         self.pay_method_drop.bind("<<ComboboxSelected>>", self.on_payment_method_change)
         
-        # Credit Card Form Container (dynamic)
+        # Credit Card Form Container (dynamic fallback)
         self.card_frame = tk.Frame(form, bg=BG_SURFACE, padx=15, pady=15, highlightbackground=BORDER_COLOR, highlightthickness=1)
         
         self.cardholder_input = ModernInput(self.card_frame, label_text="Cardholder Name", placeholder="e.g. John Doe")
@@ -1410,8 +1497,15 @@ class CheckoutModal(tk.Toplevel):
     def on_payment_method_change(self, event):
         method = self.pay_method_var.get()
         if method == "Credit Card":
-            self.card_frame.pack(fill="x", pady=10)
-            self.btn_pay.configure_text(f"Pay ${self.book['price']:.2f} via Card")
+            api_key = os.environ.get("STRIPE_API_KEY")
+            if api_key:
+                # Real Stripe is available, hide simulated card inputs
+                self.card_frame.pack_forget()
+                self.btn_pay.configure_text("💳 Pay via Stripe Secure Checkout")
+            else:
+                # Fallback to simulated card fields
+                self.card_frame.pack(fill="x", pady=10)
+                self.btn_pay.configure_text(f"Pay ${self.book['price']:.2f} via Card (Simulated)")
         elif method == "Cash on Delivery":
             self.card_frame.pack_forget()
             self.btn_pay.configure_text("Place COD Order")
@@ -1429,56 +1523,163 @@ class CheckoutModal(tk.Toplevel):
             return
             
         method = self.pay_method_var.get()
-        db_method = "Balance"
-        card_details = None
         
         if method == "Credit Card":
-            db_method = "Card"
-            cardholder = self.cardholder_input.get().strip()
-            cardno = self.cardno_input.get().strip()
-            expiry = self.expiry_input.get().strip()
-            cvv = self.cvv_input.get().strip()
-            
-            if not cardholder or not cardno or not expiry or not cvv:
-                self.controller.show_toast("Please fill in all credit card details.", is_error=True)
-                return
-                
-            # Basic validation
-            import re
-            if not re.match(r"^\d{16}$", cardno):
-                self.controller.show_toast("Card number must be exactly 16 digits.", is_error=True)
-                return
-            if not re.match(r"^\d{2}/\d{2}$", expiry):
-                self.controller.show_toast("Expiry must be in MM/YY format.", is_error=True)
-                return
-            if not re.match(r"^\d{3}$", cvv):
-                self.controller.show_toast("CVV must be exactly 3 digits.", is_error=True)
-                return
-                
-            card_details = f"Card ending in {cardno[-4:]}"
-            
+            api_key = os.environ.get("STRIPE_API_KEY")
+            if api_key:
+                self.process_stripe_payment(api_key, buyer, address)
+            else:
+                self.process_simulated_card_payment(buyer, address)
         elif method == "Cash on Delivery":
-            db_method = "Cash on Delivery"
-            
+            self.process_cod_payment(buyer, address)
         else:
-            db_method = "Balance"
-            if buyer['balance'] < self.book['price']:
-                self.controller.show_toast("Insufficient wallet balance. Top up your profile or choose another payment method.", is_error=True)
-                return
-                
+            self.process_balance_payment(buyer, address)
+
+    def process_balance_payment(self, buyer, address):
+        if buyer['balance'] < self.book['price']:
+            self.controller.show_toast("Insufficient wallet balance. Top up your profile or choose another payment method.", is_error=True)
+            return
         try:
-            success = db.buy_book(buyer['id'], self.book['id'], address, db_method, card_details)
+            success = db.buy_book(buyer['id'], self.book['id'], address, "Balance")
             if success:
-                pts = int(self.book['price'] * 12.5)
-                self.controller.show_toast(f"Purchase successful! +{pts} bonus points earned!")
-                self.refresh_callback()
-                
-                # Check if the parent of parent is BookDetailsModal, destroy that too!
-                if hasattr(self.master, "destroy"):
-                    self.master.destroy()
-                self.destroy()
+                self.payment_complete_success()
         except Exception as e:
             self.controller.show_toast(str(e), is_error=True)
+
+    def process_cod_payment(self, buyer, address):
+        try:
+            success = db.buy_book(buyer['id'], self.book['id'], address, "Cash on Delivery")
+            if success:
+                self.payment_complete_success()
+        except Exception as e:
+            self.controller.show_toast(str(e), is_error=True)
+
+    def process_simulated_card_payment(self, buyer, address):
+        cardholder = self.cardholder_input.get().strip()
+        cardno = self.cardno_input.get().strip()
+        expiry = self.expiry_input.get().strip()
+        cvv = self.cvv_input.get().strip()
+        
+        if not cardholder or not cardno or not expiry or not cvv:
+            self.controller.show_toast("Please fill in all credit card details.", is_error=True)
+            return
+            
+        # Basic validation
+        import re
+        if not re.match(r"^\d{16}$", cardno):
+            self.controller.show_toast("Card number must be exactly 16 digits.", is_error=True)
+            return
+        if not re.match(r"^\d{2}/\d{2}$", expiry):
+            self.controller.show_toast("Expiry must be in MM/YY format.", is_error=True)
+            return
+        if not re.match(r"^\d{3}$", cvv):
+            self.controller.show_toast("CVV must be exactly 3 digits.", is_error=True)
+            return
+            
+        card_details = f"Card ending in {cardno[-4:]}"
+        try:
+            success = db.buy_book(buyer['id'], self.book['id'], address, "Card", card_details)
+            if success:
+                self.payment_complete_success()
+        except Exception as e:
+            self.controller.show_toast(str(e), is_error=True)
+
+    def process_stripe_payment(self, api_key, buyer, address):
+        import stripe
+        stripe.api_key = api_key
+        
+        # Start loopback callback server
+        try:
+            if not self.server:
+                self.server = StripeCallbackServer(("localhost", 52710), StripeCallbackHandler, self)
+                self.server_thread = threading.Thread(target=self.server.serve_forever)
+                self.server_thread.daemon = True
+                self.server_thread.start()
+        except Exception as e:
+            self.controller.show_toast(f"Loopback Server Error: {str(e)}", is_error=True)
+            return
+            
+        # Create Stripe Checkout Session
+        try:
+            session = stripe.checkout.Session.create(
+                payment_method_types=['card'],
+                line_items=[{
+                    'price_data': {
+                        'currency': 'usd',
+                        'product_data': {
+                            'name': self.book['title'],
+                            'description': f"Author: {self.book['author']} | Format: {self.book['format']}",
+                        },
+                        'unit_amount': int(self.book['price'] * 100), # Stripe accepts cents
+                    },
+                    'quantity': 1,
+                }],
+                mode='payment',
+                success_url='http://localhost:52710/success?session_id={CHECKOUT_SESSION_ID}',
+                cancel_url='http://localhost:52710/cancel',
+            )
+        except Exception as e:
+            self.controller.show_toast(f"Stripe Checkout Error: {str(e)}", is_error=True)
+            self.shutdown_server()
+            return
+            
+        # Write record in DB as Unpaid
+        try:
+            db.buy_book(
+                buyer_id=buyer['id'],
+                book_id=self.book['id'],
+                address=address,
+                payment_method='Card',
+                card_details='Stripe Checkout',
+                stripe_session_id=session.id
+            )
+        except Exception as e:
+            self.controller.show_toast(f"Database Error: {str(e)}", is_error=True)
+            self.shutdown_server()
+            return
+            
+        # Redirect user
+        webbrowser.open(session.url)
+        self.btn_pay.configure_text("⌛ Awaiting Stripe Payment Confirmation...")
+        self.pay_method_drop.configure(state="disabled")
+        self.addr_input.entry.configure(state="disabled")
+        self.controller.show_toast("Secure checkout opened in browser.")
+
+    def stripe_success_callback(self):
+        self.shutdown_server()
+        self.after(100, self.payment_complete_success)
+
+    def stripe_cancel_callback(self):
+        self.shutdown_server()
+        self.after(100, self.payment_cancelled)
+
+    def payment_cancelled(self):
+        self.btn_pay.configure_text("💳 Pay via Stripe Secure Checkout")
+        self.pay_method_drop.configure(state="readonly")
+        self.addr_input.entry.configure(state="normal")
+        self.controller.show_toast("Payment was cancelled or failed.", is_error=True)
+
+    def payment_complete_success(self):
+        pts = int(self.book['price'] * 12.5)
+        self.controller.show_toast(f"Purchase successful! +{pts} bonus points earned!")
+        self.refresh_callback()
+        if hasattr(self.master, "destroy"):
+            self.master.destroy()
+        self.destroy()
+
+    def shutdown_server(self):
+        if self.server:
+            try:
+                self.server.shutdown()
+                self.server.server_close()
+            except Exception:
+                pass
+            self.server = None
+            self.server_thread = None
+
+    def destroy(self):
+        self.shutdown_server()
+        super().destroy()
 
 
 # ==========================================

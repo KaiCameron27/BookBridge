@@ -112,6 +112,10 @@ def init_db():
         cursor.execute("ALTER TABLE transactions ADD COLUMN card_details VARCHAR(255) NULL;")
     except Exception:
         pass
+    try:
+        cursor.execute("ALTER TABLE transactions ADD COLUMN stripe_session_id VARCHAR(255) NULL;")
+    except Exception:
+        pass
 
     # Таблица отзывов
     cursor.execute("""
@@ -454,7 +458,7 @@ def get_book_by_id(book_id):
     conn.close()
     return row
 
-def buy_book(buyer_id, book_id, address, payment_method='Balance', card_details=None):
+def buy_book(buyer_id, book_id, address, payment_method='Balance', card_details=None, stripe_session_id=None):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
     
@@ -492,20 +496,26 @@ def buy_book(buyer_id, book_id, address, payment_method='Balance', card_details=
                 if seller:
                     new_seller_balance = seller['balance'] + price
                     cursor.execute("UPDATE users SET balance = %s WHERE id = %s;", (new_seller_balance, seller_id))
+            status = 'Delivered' if book['format'] in ('PDF', 'EPUB') else 'Pending'
         
         elif payment_method == 'Card':
-            # Card purchases award points but do not deduct balance
-            points_earned = int(price * 12.5)
-            new_points = buyer['points'] + points_earned
-            cursor.execute("UPDATE users SET points = %s WHERE id = %s;", (new_points, buyer_id))
-            
-            seller_id = book['owner_id']
-            if seller_id:
-                cursor.execute("SELECT balance FROM users WHERE id = %s;", (seller_id,))
-                seller = cursor.fetchone()
-                if seller:
-                    new_seller_balance = seller['balance'] + price
-                    cursor.execute("UPDATE users SET balance = %s WHERE id = %s;", (new_seller_balance, seller_id))
+            if stripe_session_id is None:
+                # Legacy / mock testing mode (direct card simulation without Stripe key)
+                points_earned = int(price * 12.5)
+                new_points = buyer['points'] + points_earned
+                cursor.execute("UPDATE users SET points = %s WHERE id = %s;", (new_points, buyer_id))
+                
+                seller_id = book['owner_id']
+                if seller_id:
+                    cursor.execute("SELECT balance FROM users WHERE id = %s;", (seller_id,))
+                    seller = cursor.fetchone()
+                    if seller:
+                        new_seller_balance = seller['balance'] + price
+                        cursor.execute("UPDATE users SET balance = %s WHERE id = %s;", (new_seller_balance, seller_id))
+                status = 'Delivered' if book['format'] in ('PDF', 'EPUB') else 'Pending'
+            else:
+                # Real Stripe Checkout flow: starts as Unpaid, no balance subtraction, no points yet
+                status = 'Unpaid'
                     
         elif payment_method == 'Cash on Delivery':
             # Cash on delivery: no balance subtraction, points awarded, seller credited only when Delivered
@@ -513,29 +523,105 @@ def buy_book(buyer_id, book_id, address, payment_method='Balance', card_details=
             new_points = buyer['points'] + points_earned
             cursor.execute("UPDATE users SET points = %s WHERE id = %s;", (new_points, buyer_id))
             # Balance addition for COD seller is handled in update_transaction_status
+            status = 'Pending'
             
         else:
             raise Exception(f"Unsupported payment method: {payment_method}")
             
-        if book['owner_id'] is not None:
+        if status != 'Unpaid' and book['owner_id'] is not None:
             cursor.execute("UPDATE books SET is_sold = 1 WHERE id = %s;", (book_id,))
         
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         is_digital = book['format'] in ('PDF', 'EPUB')
         
-        status = 'Delivered' if is_digital else 'Pending'
         tracking_info = f"{now} - Order placed.\n"
+        if status == 'Delivered':
+            tracking_info += f"{now} - E-Book delivered digitally for download.\n"
+        elif status == 'Unpaid':
+            tracking_info += f"{now} - Awaiting secure Stripe credit card payment.\n"
+        else:
+            tracking_info += f"{now} - Preparing for shipment.\n"
+            
+        cursor.execute("""
+            INSERT INTO transactions (buyer_id, seller_id, book_id, price, status, delivery_address, date, tracking_info, payment_method, card_details, stripe_session_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+        """, (buyer_id, book['owner_id'], book_id, price, status, address, now, tracking_info, payment_method, card_details, stripe_session_id))
+        
+        if status != 'Unpaid':
+            # Auto-reject any pending exchange proposals involving this book
+            cursor.execute("""
+                UPDATE exchanges 
+                SET status = 'Rejected' 
+                WHERE status = 'Pending' AND (proposer_book_id = %s OR receiver_book_id = %s);
+            """, (book_id, book_id))
+        
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        raise e
+
+def confirm_stripe_payment(session_id):
+    """Confirm a transaction as paid via Stripe session_id and update status to Pending/Delivered."""
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    try:
+        # Retrieve the transaction
+        cursor.execute("SELECT * FROM transactions WHERE stripe_session_id = %s AND status = 'Unpaid';", (session_id,))
+        tx = cursor.fetchone()
+        if not tx:
+            return False
+            
+        transaction_id = tx['id']
+        book_id = tx['book_id']
+        buyer_id = tx['buyer_id']
+        price = tx['price']
+        
+        # Get book format
+        cursor.execute("SELECT * FROM books WHERE id = %s;", (book_id,))
+        book = cursor.fetchone()
+        if not book:
+            return False
+            
+        is_digital = book['format'] in ('PDF', 'EPUB')
+        status = 'Delivered' if is_digital else 'Pending'
+        
+        # Award points to buyer
+        cursor.execute("SELECT points FROM users WHERE id = %s;", (buyer_id,))
+        buyer = cursor.fetchone()
+        if buyer:
+            points_earned = int(price * 12.5)
+            new_points = buyer['points'] + points_earned
+            cursor.execute("UPDATE users SET points = %s WHERE id = %s;", (new_points, buyer_id))
+            
+        # Credit seller balance immediately for Card payments
+        seller_id = tx['seller_id']
+        if seller_id:
+            cursor.execute("SELECT balance FROM users WHERE id = %s;", (seller_id,))
+            seller = cursor.fetchone()
+            if seller:
+                new_seller_balance = seller['balance'] + price
+                cursor.execute("UPDATE users SET balance = %s WHERE id = %s;", (new_seller_balance, seller_id))
+                
+        # Mark book as sold if not system book
+        if book['owner_id'] is not None:
+            cursor.execute("UPDATE books SET is_sold = 1 WHERE id = %s;", (book_id,))
+            
+        # Update transaction status and timeline
+        tracking_info = tx['tracking_info'] + f"{now} - Stripe card payment verified successfully.\n"
         if is_digital:
             tracking_info += f"{now} - E-Book delivered digitally for download.\n"
         else:
             tracking_info += f"{now} - Preparing for shipment.\n"
             
-        cursor.execute("""
-            INSERT INTO transactions (buyer_id, seller_id, book_id, price, status, delivery_address, date, tracking_info, payment_method, card_details)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-        """, (buyer_id, book['owner_id'], book_id, price, status, address, now, tracking_info, payment_method, card_details))
+        cursor.execute(
+            "UPDATE transactions SET status = %s, tracking_info = %s WHERE id = %s;",
+            (status, tracking_info, transaction_id)
+        )
         
-        # Auto-reject any pending exchange proposals involving this book
+        # Auto-reject pending exchanges
         cursor.execute("""
             UPDATE exchanges 
             SET status = 'Rejected' 
@@ -546,7 +632,7 @@ def buy_book(buyer_id, book_id, address, payment_method='Balance', card_details=
         return True
     except Exception as e:
         conn.rollback()
-        raise e
+        return False
     finally:
         cursor.close()
         conn.close()

@@ -318,6 +318,85 @@ class TestBookBridgeDatabase(unittest.TestCase):
         sent_props = db.get_sent_exchange_proposals(user_c)
         self.assertEqual(sent_props[0]['status'], 'Rejected')
 
+    def test_10_stripe_payment_flow(self):
+        """Verifies the Stripe checkout flow: initial Unpaid status, deferred points/balance, and confirmation."""
+        seller_id = db.add_user("stripe_seller", "pass", "stripe_s@test.com", "Seller St")
+        buyer_id = db.add_user("stripe_buyer", "pass", "stripe_b@test.com", "Buyer St")
+        
+        # Add book for sale
+        book_price = 40.00
+        book_id = db.add_book(
+            title="Stripe Integration Book",
+            author="Developer",
+            description="Testing Stripe flow",
+            price=book_price,
+            language="English",
+            genre="Fiction",
+            owner_id=seller_id
+        )
+        
+        # Check initial state
+        book_before = db.get_book_by_id(book_id)
+        self.assertEqual(book_before['is_sold'], 0)
+        
+        buyer_before = db.get_user_by_id(buyer_id)
+        seller_before = db.get_user_by_id(seller_id)
+        
+        # 1. Trigger buy_book with Card and stripe_session_id
+        session_id = "cs_test_session_999"
+        success = db.buy_book(
+            buyer_id=buyer_id,
+            book_id=book_id,
+            address="Buyer St",
+            payment_method='Card',
+            card_details='Stripe Checkout',
+            stripe_session_id=session_id
+        )
+        self.assertTrue(success)
+        
+        # Book should NOT be marked as sold yet
+        book_unpaid = db.get_book_by_id(book_id)
+        self.assertEqual(book_unpaid['is_sold'], 0)
+        
+        # Buyer/Seller balances/points should NOT change yet
+        buyer_unpaid = db.get_user_by_id(buyer_id)
+        seller_unpaid = db.get_user_by_id(seller_id)
+        self.assertEqual(buyer_unpaid['balance'], buyer_before['balance'])
+        self.assertEqual(buyer_unpaid['points'], buyer_before['points'])
+        self.assertEqual(seller_unpaid['balance'], seller_before['balance'])
+        
+        # Check transaction record
+        txs = db.admin_get_all_transactions()
+        my_tx = [t for t in txs if t['stripe_session_id'] == session_id]
+        self.assertEqual(len(my_tx), 1)
+        self.assertEqual(my_tx[0]['status'], 'Unpaid')
+        
+        # 2. Confirm the Stripe payment
+        confirm_success = db.confirm_stripe_payment(session_id)
+        self.assertTrue(confirm_success)
+        
+        # Book should now be marked as sold
+        book_paid = db.get_book_by_id(book_id)
+        self.assertEqual(book_paid['is_sold'], 1)
+        
+        # Buyer points should be awarded (40 * 12.5 = 500 points)
+        buyer_paid = db.get_user_by_id(buyer_id)
+        self.assertEqual(buyer_paid['points'], buyer_before['points'] + 500)
+        self.assertEqual(buyer_paid['balance'], buyer_before['balance']) # card pays, no wallet change
+        
+        # Seller should be credited with the purchase price
+        seller_paid = db.get_user_by_id(seller_id)
+        self.assertEqual(seller_paid['balance'], seller_before['balance'] + book_price)
+        
+        # Check transaction status is now Pending
+        txs_after = db.admin_get_all_transactions()
+        my_tx_paid = [t for t in txs_after if t['stripe_session_id'] == session_id]
+        self.assertEqual(my_tx_paid[0]['status'], 'Pending')
+        
+        # 3. Confirming again should return False
+        confirm_again = db.confirm_stripe_payment(session_id)
+        self.assertFalse(confirm_again)
+
 if __name__ == "__main__":
     print("Running automated verification tests for BookBridge Phase 2 on MySQL...")
     unittest.main()
